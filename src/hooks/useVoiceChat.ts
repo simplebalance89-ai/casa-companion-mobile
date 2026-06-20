@@ -166,8 +166,7 @@ export function useVoiceChat(
     setErrorMessage('');
 
     if (state === 'listening' || state === 'wake_detected') {
-      // Push-to-talk release: stop streaming; server detects silence/end-turn and processes.
-      socket.sendCommand('stop_listening');
+      // Push-to-talk release: stop streaming; server detects silence and processes.
       audio.stopRecording();
       return;
     }
@@ -186,7 +185,8 @@ export function useVoiceChat(
     setLastTranscript('');
     setLastResponse('');
 
-    socket.sendCommand('start_listening');
+    // The V3 engine treats 'wake' as a push-to-talk trigger.
+    socket.sendCommand('wake');
     void audio.unlockAudio().then(() => audio.startRecording());
   }, [audio, socket]);
 

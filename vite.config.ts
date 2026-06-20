@@ -8,6 +8,10 @@ const sentryAuthToken = process.env.SENTRY_AUTH_TOKEN;
 const sentryOrg = process.env.SENTRY_ORG;
 const sentryProject = process.env.SENTRY_PROJECT;
 
+// Strong cache bust: every build gets a fresh Workbox cache name so the
+// service worker re-downloads all assets instead of serving stale ones.
+const buildVersion = process.env.GITHUB_SHA?.slice(0, 8) || Date.now().toString(36);
+
 export default defineConfig({
   plugins: [
     react(),
@@ -21,6 +25,7 @@ export default defineConfig({
         skipWaiting: true,
         clientsClaim: true,
         cleanupOutdatedCaches: true,
+        cacheId: `casa-mobile-${buildVersion}`,
       },
     }),
     sentryAuthToken && sentryOrg && sentryProject

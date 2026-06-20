@@ -40,6 +40,8 @@ jobs:
           VITE_API_URL: ${{ secrets.VITE_API_URL }}
           VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
           VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+          VITE_VOICE_SERVER_URL: ${{ vars.VITE_VOICE_SERVER_URL || 'wss://casa-voice-agent.fly.dev/ws/voice-v3' }}
+          VITE_VOICE_SERVER_API_KEY: ${{ secrets.VITE_VOICE_SERVER_API_KEY }}
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

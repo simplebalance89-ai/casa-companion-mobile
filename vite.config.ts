@@ -16,7 +16,7 @@ export default defineConfig({
       manifest: false,
       injectRegister: 'auto',
       workbox: {
-        globPatterns: ['**/*.{js,css,html,ico,png,svg,webp,mp4,webmanifest}'],
+        globPatterns: ['**/*.{js,css,html,ico,png,svg,webp,webmanifest}'],
         maximumFileSizeToCacheInBytes: 50 * 1024 * 1024,
         skipWaiting: true,
         clientsClaim: true,

@@ -1,485 +1,303 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
-import type { Character, ModeConfig } from '@/types';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
-const VOICE_SERVER_URL =
-  (import.meta as Record<string, any>).env.VITE_VOICE_SERVER_URL ||
-  'wss://casa-voice-agent.fly.dev/ws/voice';
-
-export type VoiceState = 'idle' | 'listening' | 'processing' | 'speaking' | 'error';
-
-export interface ChatMessage {
-  role: 'user' | 'assistant';
-  text: string;
+function log(...args: unknown[]) {
+  console.log('[VoiceSocket]', ...args);
 }
 
+function logError(...args: unknown[]) {
+  console.error('[VoiceSocket]', ...args);
+}
+
+export type VoiceState = 'idle' | 'wake_detected' | 'listening' | 'processing' | 'speaking' | 'interrupted';
+export type TurnState = VoiceState;
+
+export type ServerMessage =
+  | { type: 'state_change'; state: VoiceState }
+  | { type: 'transcript'; text: string; final?: boolean }
+  | { type: 'assistant_text'; text: string }
+  | { type: 'config_change'; character?: string; mode?: string; volume?: number }
+  | { type: 'error'; code: string; message: string }
+  | { type: 'interrupt_ack' }
+  | { type: 'pong' }
+  | { type: 'device_connected'; device_id: string; device_type: string }
+  | { type: 'device_disconnected'; device_id: string; device_type: string };
+
 export interface UseVoiceSocketOptions {
-  character: Character | null;
-  mode?: ModeConfig;
-  onTurnStateChange?: (state: VoiceState) => void;
+  url: string;
+  token?: string;
+  sessionId?: string;
+  deviceId?: string;
+  deviceType?: 'audio' | 'dashboard';
+  onStateChange?: (state: VoiceState) => void;
+  onTranscript?: (text: string, isFinal: boolean) => void;
+  onAssistantText?: (text: string) => void;
+  onConfigChange?: (change: { character?: string; mode?: string; volume?: number }) => void;
+  onError?: (code: string, message: string) => void;
+  onBinary?: (pcm: ArrayBuffer) => void;
+  onOpen?: () => void;
+  onClose?: () => void;
+  reconnect?: boolean;
 }
 
 export interface UseVoiceSocketReturn {
-  voiceState: VoiceState;
-  messages: ChatMessage[];
-  lastTranscript: string;
-  lastResponse: string;
-  error: string | null;
-  isConnected: boolean;
-  startListening: () => Promise<void>;
-  stopListening: () => void;
-  sendTextMessage: (text: string) => void;
-  interrupt: () => void;
-  clearError: () => void;
+  connected: boolean;
+  connecting: boolean;
+  state: VoiceState;
+  sendCommand: (command: string) => void;
+  sendConfigChange: (change: { character?: string; mode?: string; volume?: number }) => void;
+  sendTextInput: (text: string) => void;
+  sendPing: () => void;
+  sendBinary: (data: ArrayBuffer | ArrayBufferView) => void;
+  connect: () => void;
+  disconnect: () => void;
 }
 
-interface CharacterVoiceConfig {
-  voice?: SpeechSynthesisVoice;
-  pitch: number;
-  rate: number;
-  lang: string;
-}
-
-function getVoiceForCharacter(_character: Character | null): CharacterVoiceConfig {
-  const voices = window.speechSynthesis?.getVoices() || [];
-  const preferred =
-    voices.find((v) => v.lang.startsWith('en-US') && v.name.includes('Google')) ||
-    voices.find((v) => v.lang.startsWith('en')) ||
-    voices[0];
-  return {
-    voice: preferred,
-    pitch: 1,
-    rate: 1,
-    lang: preferred?.lang || 'en-US',
-  };
-}
+const PING_INTERVAL_MS = 20000;
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 30000;
 
 export function useVoiceSocket(options: UseVoiceSocketOptions): UseVoiceSocketReturn {
-  const { character, mode, onTurnStateChange } = options;
-  const [voiceState, setVoiceState] = useState<VoiceState>('idle');
-  const voiceStateRef = useRef<VoiceState>('idle');
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [isConnected, setIsConnected] = useState(false);
-  const [lastTranscript, setLastTranscript] = useState('');
-  const [lastResponse, setLastResponse] = useState('');
+  const {
+    url,
+    token,
+    sessionId = 'mobile',
+    deviceId = generateDeviceId(),
+    deviceType = 'audio',
+    reconnect = true,
+  } = options;
+
+  const [connected, setConnected] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [state, setState] = useState<VoiceState>('idle');
 
   const wsRef = useRef<WebSocket | null>(null);
-  const audioContextRef = useRef<AudioContext | null>(null);
-  const mediaStreamRef = useRef<MediaStream | null>(null);
-  const mediaStreamSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
-  const workletNodeRef = useRef<AudioWorkletNode | null>(null);
-  const audioWorkletLoadedRef = useRef(false);
-  const playbackQueueRef = useRef<Float32Array[]>([]);
-  const isPlayingRef = useRef(false);
-  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reconnectAttemptsRef = useRef(0);
-  const maxReconnectAttempts = 5;
+  const pingIntervalRef = useRef<number | null>(null);
+  const reconnectTimeoutRef = useRef<number | null>(null);
+  const reconnectAttemptRef = useRef(0);
+  const shouldReconnectRef = useRef(reconnect);
 
-  const fallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pendingTtsTextRef = useRef<string | null>(null);
-  const audioReceivedForTurnRef = useRef(false);
-
-  // Keep a live ref so AudioWorklet callbacks see the current state.
+  const optionsRef = useRef(options);
   useEffect(() => {
-    voiceStateRef.current = voiceState;
-    onTurnStateChange?.(voiceState);
-  }, [voiceState, onTurnStateChange]);
+    optionsRef.current = options;
+  });
 
-  const speakWithBrowserTTS = useCallback((text: string) => {
-    if (typeof window === 'undefined' || !window.speechSynthesis) return;
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    const config = getVoiceForCharacter(character);
-    if (config.voice) utterance.voice = config.voice;
-    utterance.pitch = config.pitch;
-    utterance.rate = config.rate;
-    utterance.lang = config.lang;
-    window.speechSynthesis.speak(utterance);
-  }, [character]);
-
-  const initAudio = useCallback(async () => {
-    if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
-      audioContextRef.current = new AudioContext({ sampleRate: 16000 });
+  const clearTimers = useCallback(() => {
+    if (pingIntervalRef.current) {
+      window.clearInterval(pingIntervalRef.current);
+      pingIntervalRef.current = null;
     }
-    if (audioContextRef.current.state === 'suspended') {
-      await audioContextRef.current.resume();
+    if (reconnectTimeoutRef.current) {
+      window.clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
     }
-    return audioContextRef.current;
   }, []);
 
-  const playAudio = useCallback((pcmData: Float32Array) => {
-    const ctx = audioContextRef.current;
-    if (!ctx) return;
-
-    if (ctx.state === 'suspended') {
-      ctx.resume().catch(() => {});
+  const cleanupSocket = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws) return;
+    ws.onopen = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onmessage = null;
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      ws.close();
     }
+    wsRef.current = null;
+  }, []);
 
-    const buffer = ctx.createBuffer(1, pcmData.length, 16000);
-    buffer.copyToChannel(pcmData, 0);
+  const disconnect = useCallback(() => {
+    shouldReconnectRef.current = false;
+    clearTimers();
+    cleanupSocket();
+    setConnected(false);
+    setConnecting(false);
+  }, [clearTimers, cleanupSocket]);
 
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
-    source.onended = () => {
-      if (playbackQueueRef.current.length > 0) {
-        const next = playbackQueueRef.current.shift()!;
-        playAudio(next);
+  const handleMessage = useCallback((event: MessageEvent) => {
+    if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
+      const process = (buffer: ArrayBuffer) => {
+        optionsRef.current.onBinary?.(buffer);
+      };
+      if (event.data instanceof Blob) {
+        event.data.arrayBuffer().then(process).catch(logError);
       } else {
-        isPlayingRef.current = false;
+        process(event.data);
       }
-    };
-    source.start();
-  }, []);
-
-  const queueAudio = useCallback(
-    (pcmData: Float32Array) => {
-      if (!isPlayingRef.current) {
-        isPlayingRef.current = true;
-        playAudio(pcmData);
-      } else {
-        playbackQueueRef.current.push(pcmData);
-      }
-    },
-    [playAudio]
-  );
-
-  const pcmToFloat32 = useCallback((buffer: ArrayBuffer) => {
-    const int16Array = new Int16Array(buffer);
-    const float32Array = new Float32Array(int16Array.length);
-    for (let i = 0; i < int16Array.length; i++) {
-      float32Array[i] = int16Array[i] / 32768;
+      return;
     }
-    return float32Array;
-  }, []);
 
-  const sendCommand = useCallback((command: string) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'command', command }));
-    }
-  }, []);
+    try {
+      const msg = JSON.parse(event.data as string) as ServerMessage;
+      log('←', msg.type, msg);
 
-  const sendConfig = useCallback(() => {
-    if (!character || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-    wsRef.current.send(
-      JSON.stringify({
-        type: 'config_change',
-        character: character.slug,
-        mode: mode?.slug || 'introduction',
-      })
-    );
-  }, [character, mode]);
-
-  const connect = useCallback(
-    (deviceId?: string) => {
-      if (wsRef.current?.readyState === WebSocket.OPEN) return;
-
-      const url = new URL(VOICE_SERVER_URL);
-      if (deviceId) url.searchParams.set('device_id', deviceId);
-      url.searchParams.set('device_type', 'audio');
-
-      try {
-        const ws = new WebSocket(url.toString());
-        ws.binaryType = 'arraybuffer';
-        wsRef.current = ws;
-
-        ws.onopen = () => {
-          setIsConnected(true);
-          setError(null);
-          reconnectAttemptsRef.current = 0;
-          sendConfig();
-        };
-
-        ws.onmessage = (event) => {
-          if (typeof event.data === 'string') {
-            try {
-              const msg = JSON.parse(event.data);
-              handleMessage(msg);
-            } catch {
-              // ignore malformed JSON
-            }
-          } else if (event.data instanceof ArrayBuffer) {
-            audioReceivedForTurnRef.current = true;
-            if (fallbackTimerRef.current) {
-              clearTimeout(fallbackTimerRef.current);
-              fallbackTimerRef.current = null;
-            }
-            pendingTtsTextRef.current = null;
-            const pcmData = pcmToFloat32(event.data);
-            queueAudio(pcmData);
-          }
-        };
-
-        ws.onerror = () => {
-          setError('Connection error. Retrying...');
-        };
-
-        ws.onclose = () => {
-          setIsConnected(false);
-          wsRef.current = null;
-
-          if (reconnectAttemptsRef.current < maxReconnectAttempts) {
-            reconnectAttemptsRef.current++;
-            const delay = Math.min(1000 * Math.pow(2, reconnectAttemptsRef.current), 30000);
-            reconnectTimeoutRef.current = setTimeout(() => {
-              connect(deviceId);
-            }, delay);
-          } else {
-            setError('Could not connect to voice server.');
-            setVoiceState('error');
-          }
-        };
-      } catch (err) {
-        setError('Failed to connect to voice server');
-        setVoiceState('error');
-      }
-    },
-    [pcmToFloat32, queueAudio, sendConfig]
-  );
-
-  const addMessage = useCallback((role: 'user' | 'assistant', text: string) => {
-    setMessages((prev) => [...prev, { role, text }]);
-  }, []);
-
-  const handleMessage = useCallback(
-    (msg: any) => {
       switch (msg.type) {
         case 'state_change':
-          setVoiceState(msg.state);
-          if (msg.state === 'speaking') {
-            audioReceivedForTurnRef.current = false;
-            pendingTtsTextRef.current = null;
-            isPlayingRef.current = false;
-            playbackQueueRef.current = [];
-            if (fallbackTimerRef.current) {
-              clearTimeout(fallbackTimerRef.current);
-              fallbackTimerRef.current = null;
-            }
-          }
-          if (msg.state === 'idle') {
-            if (fallbackTimerRef.current) {
-              clearTimeout(fallbackTimerRef.current);
-              fallbackTimerRef.current = null;
-            }
-            pendingTtsTextRef.current = null;
-            audioReceivedForTurnRef.current = false;
-          }
+          setState(msg.state);
+          optionsRef.current.onStateChange?.(msg.state);
           break;
-
         case 'transcript':
-          if (msg.text) {
-            setLastTranscript(msg.text);
-            addMessage('user', msg.text);
-          }
+          optionsRef.current.onTranscript?.(msg.text, msg.final ?? true);
           break;
-
         case 'assistant_text':
-          if (msg.text) {
-            setLastResponse(msg.text);
-            addMessage('assistant', msg.text);
-            if (!audioReceivedForTurnRef.current) {
-              pendingTtsTextRef.current = msg.text;
-              if (fallbackTimerRef.current) clearTimeout(fallbackTimerRef.current);
-              fallbackTimerRef.current = setTimeout(() => {
-                if (!audioReceivedForTurnRef.current && pendingTtsTextRef.current) {
-                  speakWithBrowserTTS(pendingTtsTextRef.current);
-                  pendingTtsTextRef.current = null;
-                }
-              }, 1200);
-            }
-          }
+          optionsRef.current.onAssistantText?.(msg.text);
           break;
-
-        case 'error':
-          setError(msg.message || 'An error occurred');
-          setVoiceState('error');
-          break;
-
         case 'config_change':
-          // Server confirmed config change.
+          optionsRef.current.onConfigChange?.({
+            character: msg.character,
+            mode: msg.mode,
+            volume: msg.volume,
+          });
           break;
-
+        case 'error':
+          logError('server error', msg.code, msg.message);
+          optionsRef.current.onError?.(msg.code, msg.message);
+          break;
         case 'interrupt_ack':
-          // Server confirmed interrupt; no UI action needed.
           break;
-
+        case 'pong':
+          break;
+        case 'device_connected':
+        case 'device_disconnected':
+          break;
         default:
-          console.log('[VoiceSocket] Unknown message type:', msg.type);
+          break;
       }
-    },
-    [addMessage, speakWithBrowserTTS]
-  );
+    } catch (e) {
+      logError('Failed to parse server message', event.data, e);
+    }
+  }, []);
 
-  const startListening = useCallback(async () => {
+  const connect = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN || wsRef.current?.readyState === WebSocket.CONNECTING) {
+      return;
+    }
+
+    clearTimers();
+    cleanupSocket();
+    setConnecting(true);
+
+    const params = new URLSearchParams();
+    params.set('device_type', deviceType);
+    params.set('session_id', sessionId);
+    if (token) params.set('token', token);
+
+    // V3 endpoint expects device_id as a path segment: /ws/voice-v3/{device_id}?...
+    const base = url.replace(/\/$/, '');
+    const fullUrl = `${base}/${encodeURIComponent(deviceId)}?${params.toString()}`;
+    log('connecting to', fullUrl);
+
     try {
-      setError(null);
-      await initAudio();
+      const ws = new WebSocket(fullUrl);
+      ws.binaryType = 'arraybuffer';
+      wsRef.current = ws;
 
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-        connect();
-        await new Promise((resolve) => setTimeout(resolve, 500));
-      }
+      ws.onopen = () => {
+        log('connected');
+        reconnectAttemptRef.current = 0;
+        setConnected(true);
+        setConnecting(false);
+        optionsRef.current.onOpen?.();
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          sampleRate: 16000,
-          channelCount: 1,
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
-      });
-      mediaStreamRef.current = stream;
+        pingIntervalRef.current = window.setInterval(() => {
+          sendJson(ws, { type: 'ping' });
+        }, PING_INTERVAL_MS);
+      };
 
-      const ctx = audioContextRef.current!;
-      if (!audioWorkletLoadedRef.current) {
-        const workletCode = `
-          class PCMProcessor extends AudioWorkletProcessor {
-            process(inputs, outputs, parameters) {
-              const input = inputs[0];
-              if (input && input[0]) {
-                const int16Data = new Int16Array(input[0].length);
-                for (let i = 0; i < input[0].length; i++) {
-                  int16Data[i] = Math.max(-32768, Math.min(32767, input[0][i] * 32768));
-                }
-                this.port.postMessage(int16Data.buffer, [int16Data.buffer]);
-              }
-              return true;
-            }
-          }
-          registerProcessor('pcm-processor', PCMProcessor);
-        `;
+      ws.onclose = () => {
+        log('disconnected');
+        setConnected(false);
+        setConnecting(false);
+        optionsRef.current.onClose?.();
 
-        const blob = new Blob([workletCode], { type: 'application/javascript' });
-        const workletUrl = URL.createObjectURL(blob);
-        try {
-          await ctx.audioWorklet.addModule(workletUrl);
-          audioWorkletLoadedRef.current = true;
-        } catch {
-          audioWorkletLoadedRef.current = true;
-        }
-        URL.revokeObjectURL(workletUrl);
-      }
-
-      const source = ctx.createMediaStreamSource(stream);
-      mediaStreamSourceRef.current = source;
-      const workletNode = new AudioWorkletNode(ctx, 'pcm-processor');
-      workletNodeRef.current = workletNode;
-
-      workletNode.port.onmessage = (event) => {
-        if (wsRef.current?.readyState === WebSocket.OPEN && voiceStateRef.current === 'listening') {
-          wsRef.current.send(event.data);
+        if (shouldReconnectRef.current) {
+          const delay = Math.min(RECONNECT_BASE_MS * 2 ** reconnectAttemptRef.current, RECONNECT_MAX_MS);
+          reconnectAttemptRef.current += 1;
+          reconnectTimeoutRef.current = window.setTimeout(() => {
+            connect();
+          }, delay);
         }
       };
 
-      source.connect(workletNode);
-      sendCommand('start_listening');
-    } catch (err) {
-      let msg = 'Could not access microphone';
-      if (err instanceof DOMException) {
-        if (err.name === 'NotFoundError') msg = 'No microphone found.';
-        else if (err.name === 'NotAllowedError') msg = 'Microphone permission denied.';
-        else if (err.name === 'NotReadableError') msg = 'Microphone is busy.';
-      }
-      setError(msg);
-      setVoiceState('error');
+      ws.onerror = (err) => {
+        logError('websocket error', err);
+      };
+
+      ws.onmessage = handleMessage;
+    } catch (e) {
+      logError('failed to create websocket', e);
+      setConnecting(false);
     }
-  }, [initAudio, connect, sendCommand]);
+  }, [url, token, sessionId, deviceId, deviceType, clearTimers, cleanupSocket, handleMessage]);
 
-  const stopListening = useCallback(() => {
-    if (mediaStreamSourceRef.current) {
-      try {
-        mediaStreamSourceRef.current.disconnect();
-      } catch {
-        // ignore
-      }
-      mediaStreamSourceRef.current = null;
-    }
-
-    if (workletNodeRef.current) {
-      try {
-        workletNodeRef.current.disconnect();
-        workletNodeRef.current.port.onmessage = null;
-      } catch {
-        // ignore
-      }
-      workletNodeRef.current = null;
-    }
-
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach((track) => track.stop());
-      mediaStreamRef.current = null;
-    }
-
-    sendCommand('stop_listening');
-  }, [sendCommand]);
-
-  const sendTextMessage = useCallback(
-    (text: string) => {
-      if (!text.trim()) return;
-      addMessage('user', text.trim());
-
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify({ type: 'text_input', text: text.trim() }));
-      } else {
-        setError('Voice server not connected');
-        setVoiceState('error');
-      }
-    },
-    [addMessage]
-  );
-
-  const interrupt = useCallback(() => {
-    playbackQueueRef.current = [];
-    isPlayingRef.current = false;
-    sendCommand('interrupt');
-  }, [sendCommand]);
-
-  const clearError = useCallback(() => {
-    setError(null);
-    if (voiceState === 'error') setVoiceState('idle');
-  }, [voiceState]);
-
-  // Send config whenever character/mode changes and socket is open.
-  useEffect(() => {
-    sendConfig();
-  }, [sendConfig]);
-
-  // Cleanup on unmount.
-  useEffect(() => {
-    return () => {
-      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-      if (mediaStreamSourceRef.current) {
-        try {
-          mediaStreamSourceRef.current.disconnect();
-        } catch {
-          // ignore
-        }
-      }
-      if (workletNodeRef.current) {
-        try {
-          workletNodeRef.current.disconnect();
-        } catch {
-          // ignore
-        }
-      }
-      if (mediaStreamRef.current) mediaStreamRef.current.getTracks().forEach((t) => t.stop());
-      if (audioContextRef.current) audioContextRef.current.close();
-      if (wsRef.current) wsRef.current.close();
-    };
+  const sendCommand = useCallback((command: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    sendJson(ws, { type: 'command', command });
   }, []);
 
+  const sendConfigChange = useCallback((change: { character?: string; mode?: string; volume?: number }) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    sendJson(ws, { type: 'config_change', ...change });
+  }, []);
+
+  const sendTextInput = useCallback((text: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    sendJson(ws, { type: 'text_input', text });
+  }, []);
+
+  const sendPing = useCallback(() => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    sendJson(ws, { type: 'ping' });
+  }, []);
+
+  const sendBinary = useCallback((data: ArrayBuffer | ArrayBufferView) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(data);
+  }, []);
+
+  useEffect(() => {
+    shouldReconnectRef.current = reconnect;
+  }, [reconnect]);
+
+  useEffect(() => {
+    connect();
+    return () => {
+      disconnect();
+    };
+  }, [connect, disconnect]);
+
   return {
-    voiceState,
-    messages,
-    lastTranscript,
-    lastResponse,
-    error,
-    isConnected,
-    startListening,
-    stopListening,
-    sendTextMessage,
-    interrupt,
-    clearError,
+    connected,
+    connecting,
+    state,
+    sendCommand,
+    sendConfigChange,
+    sendTextInput,
+    sendPing,
+    sendBinary,
+    connect,
+    disconnect,
   };
+}
+
+function sendJson(ws: WebSocket, data: unknown) {
+  try {
+    ws.send(JSON.stringify(data));
+  } catch (e) {
+    logError('send failed', data, e);
+  }
+}
+
+function generateDeviceId(): string {
+  const stored = typeof window !== 'undefined' ? localStorage.getItem('cc_device_id') : null;
+  if (stored) return stored;
+  const id = `mobile-${Math.random().toString(36).slice(2, 8)}-${Date.now().toString(36).slice(-4)}`;
+  if (typeof window !== 'undefined') {
+    localStorage.setItem('cc_device_id', id);
+  }
+  return id;
 }

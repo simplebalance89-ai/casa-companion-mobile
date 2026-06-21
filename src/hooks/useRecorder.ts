@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 export interface UseRecorderOptions {
   onDataAvailable?: (chunk: Blob) => void;
@@ -117,14 +117,21 @@ export function useRecorder(options: UseRecorderOptions): UseRecorderReturn {
   useEffect(() => {
     return () => {
       clearRecordingTimeout();
-      mediaRecorderRef.current?.stop();
+      try {
+        mediaRecorderRef.current?.stop();
+      } catch {
+        // ignore
+      }
       streamRef.current?.getTracks().forEach((track) => track.stop());
     };
   }, [clearRecordingTimeout]);
 
-  return {
-    isRecording,
-    startRecording,
-    stopRecording,
-  };
+  return useMemo(
+    () => ({
+      isRecording,
+      startRecording,
+      stopRecording,
+    }),
+    [isRecording, startRecording, stopRecording]
+  );
 }

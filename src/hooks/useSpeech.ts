@@ -1,4 +1,4 @@
-import { useCallback, useRef } from 'react';
+import { useCallback, useMemo, useRef } from 'react';
 import type { Character, ModeConfig } from '@/types';
 import { characterConfigs } from '@/lib/characterConfig';
 import { getOpenAIKey } from '@/lib/settings';
@@ -19,6 +19,11 @@ export interface UseSpeechReturn {
 
 const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 
+const ENV_OPENAI_KEY = (import.meta.env.VITE_OPENAI_API_KEY as string | undefined)?.replace(
+  /^\uFEFF/,
+  ''
+);
+
 interface OpenAIResponse {
   choices?: Array<{
     message?: {
@@ -38,7 +43,7 @@ export function useSpeech(options: UseSpeechOptions): UseSpeechReturn {
 
   const speak = useCallback(
     async (userText: string) => {
-      const openaiKey = getOpenAIKey();
+      const openaiKey = getOpenAIKey() ?? ENV_OPENAI_KEY;
       if (!openaiKey) {
         onError('OpenAI API key is not configured.');
         onComplete();
@@ -108,8 +113,11 @@ export function useSpeech(options: UseSpeechOptions): UseSpeechReturn {
     [characterRef, modeRef, onResponseText, onComplete, onError]
   );
 
-  return {
-    speak,
-    stop,
-  };
+  return useMemo(
+    () => ({
+      speak,
+      stop,
+    }),
+    [speak, stop]
+  );
 }

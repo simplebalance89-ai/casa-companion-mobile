@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Character, ModeConfig } from '@/types';
 import {
   getMessageCount,
@@ -143,6 +143,8 @@ export function useSimpleVoiceChat(
   });
 
   const toggleRecording = useCallback(() => {
+    if (turnStateRef.current === 'processing') return;
+
     setErrorMessage('');
     const state = turnStateRef.current;
 
@@ -198,17 +200,31 @@ export function useSimpleVoiceChat(
     [speech]
   );
 
-  return {
-    turnState,
-    lastTranscript,
-    lastResponse,
-    errorMessage,
-    messages,
-    messageCount,
-    sessionDurationSeconds,
-    toggleRecording,
-    reset,
-    sendText,
-    wakeListening: false,
-  };
+  return useMemo(
+    () => ({
+      turnState,
+      lastTranscript,
+      lastResponse,
+      errorMessage,
+      messages,
+      messageCount,
+      sessionDurationSeconds,
+      toggleRecording,
+      reset,
+      sendText,
+      wakeListening: false,
+    }),
+    [
+      turnState,
+      lastTranscript,
+      lastResponse,
+      errorMessage,
+      messages,
+      messageCount,
+      sessionDurationSeconds,
+      toggleRecording,
+      reset,
+      sendText,
+    ]
+  );
 }

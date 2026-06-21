@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { getDeepgramKey } from '@/lib/settings';
 
 export interface UseTranscriptionReturn {
@@ -64,8 +64,11 @@ export function useTranscription(): UseTranscriptionReturn {
     }
   }, []);
 
-  return {
-    transcribeAudio,
-    isTranscribing,
-  };
+  return useMemo(
+    () => ({
+      transcribeAudio,
+      isTranscribing,
+    }),
+    [transcribeAudio, isTranscribing]
+  );
 }
